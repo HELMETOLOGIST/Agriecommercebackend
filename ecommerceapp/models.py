@@ -18,6 +18,118 @@ try:
     import markdown  # pip install markdown
 except Exception:
     markdown = None
+from django.db.models import Sum
+from django.core.cache import cache
+from django.core.mail import EmailMultiAlternatives
+from django.conf import settings
+
+
+
+class AdminAlertState(models.Model):
+    """
+    Stores last day we sent product alert email.
+    One row per key.
+    """
+    key = models.CharField(max_length=64, unique=True)
+    last_sent_on = models.DateField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self) -> str:
+        return f"{self.key} ({self.last_sent_on})"
+def _split_csv_emails(value):
+    if not value:
+        return []
+    return [e.strip() for e in str(value).replace(";", ",").split(",") if e.strip()]
+
+def _admin_recipients_model():
+    for key in ("BACKEND_NOTIFY_EMAILS", "CONTACT_NOTIFY_EMAILS", "LEAD_NOTIFY_EMAILS"):
+        emails = _split_csv_emails(getattr(settings, key, None))
+        if emails:
+            return emails
+    fallback = getattr(settings, "DEFAULT_FROM_EMAIL", None) or getattr(settings, "EMAIL_HOST_USER", None)
+    return [fallback] if fallback else []
+
+def _from_email_model():
+    return getattr(settings, "DEFAULT_FROM_EMAIL", None) or getattr(settings, "EMAIL_HOST_USER", None) or "no-reply@example.com"
+
+def _email_stock_once(product_id: int, product_name: str, qty: int):
+    # throttle 1/day for same qty state
+    ck = f"low_stock_email:{product_id}:{qty}"
+    if cache.get(ck):
+        return
+    cache.set(ck, True, 24 * 3600)
+
+    to_list = _admin_recipients_model()
+    if not to_list:
+        return
+
+    subject = f"[Stock Alert] {product_name} ({qty} left)"
+    text = f"Product: {product_name}\nRemaining: {qty}\nAdmin: /admin/products/{product_id}"
+    msg = EmailMultiAlternatives(subject, text, _from_email_model(), to_list)
+    msg.send(fail_silently=True)
+
+@transaction.atomic
+def confirm_and_decrement_stock(self):
+    if self.status != "pending":
+        return
+
+    vendor_qty = {}
+    vendor_sales = {}
+
+    for item in self.cart.items.select_related("product", "variant", "product__vendor"):
+        if item.quantity <= 0:
+            continue
+
+        # decrement
+        if item.variant_id:
+            v = item.variant
+            if item.quantity > v.quantity:
+                raise ValueError(f"Insufficient stock for variant {v}")
+            v.quantity = v.quantity - item.quantity
+            v.save(update_fields=["quantity"])
+
+            # ✅ IMPORTANT: recompute product.quantity from active variants
+            p = item.product
+            total = p.variants.filter(is_active=True).aggregate(s=Sum("quantity"))["s"] or 0
+            total = int(total)
+
+            Product.objects.filter(pk=p.pk).update(
+                quantity=total,
+                in_stock=(total > 0),
+                limited_stock=(0 < total < 20),
+            )
+
+            # ✅ email if <=5
+            if total <= 5:
+                _email_stock_once(p.id, p.name, total)
+
+        else:
+            p = item.product
+            if item.quantity > p.quantity:
+                raise ValueError(f"Insufficient stock for {p.name}")
+            p.quantity = p.quantity - item.quantity
+            p.save(update_fields=["quantity", "in_stock", "limited_stock"])
+
+            if p.quantity <= 5:
+                _email_stock_once(p.id, p.name, int(p.quantity))
+
+        Product.objects.filter(pk=item.product_id).update(sold_count=F("sold_count") + item.quantity)
+
+        vid = getattr(item.product.vendor, "id", None)
+        if vid:
+            vendor_qty[vid] = vendor_qty.get(vid, 0) + int(item.quantity)
+            vendor_sales[vid] = vendor_sales.get(vid, 0) + item.line_total
+
+    self.status = "confirmed"
+    self.save(update_fields=["status"])
+
+    for vid, q in vendor_qty.items():
+        Vendor.objects.filter(id=vid).update(
+            total_units_sold=F("total_units_sold") + q,
+            total_revenue=F("total_revenue") + vendor_sales.get(vid, Decimal("0"))
+        )
+
+
 # ─────── User model ───────
 class UserManager(BaseUserManager):
     def _create(self, email, password, **extra):
@@ -247,7 +359,40 @@ class Category(TimeStampedMixin):
             names.insert(0, p.name)
             p = p.parent
         return " / ".join(names)
+class Supplier(models.Model):
+    name = models.CharField(max_length=200)
 
+    # nullable / blank fields
+    code = models.CharField(max_length=50, blank=True, null=True)
+    contact_person = models.CharField(max_length=200, blank=True, null=True)
+    email = models.EmailField(blank=True, null=True)
+    phone = models.CharField(max_length=50, blank=True, null=True)
+
+    address_line1 = models.CharField(max_length=255, blank=True, null=True)
+    address_line2 = models.CharField(max_length=255, blank=True, null=True)
+    city = models.CharField(max_length=100, blank=True, null=True)
+    state = models.CharField(max_length=100, blank=True, null=True)
+    postcode = models.CharField(max_length=20, blank=True, null=True)
+    country = models.CharField(max_length=2, default="IN")
+
+    gst_number = models.CharField(max_length=50, blank=True, null=True)
+    notes = models.TextField(blank=True, null=True)
+
+    is_active = models.BooleanField(default=True)
+
+    # optional snapshot fields (can be null)
+    total_products_supplied = models.PositiveIntegerField(blank=True, null=True)
+    total_quantity_sold = models.PositiveIntegerField(blank=True, null=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self) -> str:
+        return self.name
+    
 # ─────── Product & ProductImage ───────
 class Product(TimeStampedMixin):
     category         = models.ForeignKey(Category, related_name="products", on_delete=models.PROTECT)
@@ -257,6 +402,13 @@ class Product(TimeStampedMixin):
     # Ownership / store
     vendor           = models.ForeignKey(Vendor, null=True, blank=True, related_name="products", on_delete=models.SET_NULL)
     store            = models.ForeignKey(Store,  null=True, blank=True, related_name="products", on_delete=models.SET_NULL)
+    supplier = models.ForeignKey(
+        Supplier,
+        null=True,
+        blank=True,
+        related_name="products",
+        on_delete=models.SET_NULL,
+    )
 
     quantity         = models.PositiveIntegerField(default=0)
     grade            = models.CharField(max_length=50, blank=True)
@@ -318,6 +470,7 @@ class Product(TimeStampedMixin):
     reviews_count = models.PositiveIntegerField(default=0)
     rating_avg    = models.DecimalField(max_digits=3, decimal_places=2, default=Decimal("0.00"))
     wishes_count  = models.PositiveIntegerField(default=0)
+    
 
     # def save(self, *args, **kwargs):
     #     if not self.slug:
@@ -658,43 +811,64 @@ class Order(TimeStampedMixin):
 
     @transaction.atomic
     def confirm_and_decrement_stock(self):
+        """
+        Decrement stock exactly once when order is pending.
+        - Decrements variant stock if variant line
+        - Decrements product stock if no variant
+        - Recomputes Product.quantity from variants when variants exist
+        - Updates in_stock / limited_stock flags
+        """
         if self.status != "pending":
             return
-        vendor_qty = {}
-        vendor_sales = {}
 
         for item in self.cart.items.select_related("product", "variant", "product__vendor"):
             if item.quantity <= 0:
                 continue
+
+            # --- Variant purchase ---
             if item.variant_id:
-                v = item.variant
+                # lock the variant row (avoid race conditions)
+                v = ProductVariant.objects.select_for_update().get(pk=item.variant_id)
+
                 if item.quantity > v.quantity:
                     raise ValueError(f"Insufficient stock for variant {v}")
-                v.quantity = v.quantity - item.quantity
-                v.save(update_fields=["quantity"])
+
+                # atomic decrement
+                ProductVariant.objects.filter(pk=v.pk).update(quantity=F("quantity") - item.quantity)
+
+                # recompute product quantity from all variants
+                total = (
+                    ProductVariant.objects.filter(product_id=item.product_id)
+                    .aggregate(s=Sum("quantity"))
+                    .get("s")
+                    or 0
+                )
+                Product.objects.filter(pk=item.product_id).update(
+                    quantity=total,
+                    in_stock=(total > 0),
+                    limited_stock=(total > 0 and total <= 5),
+                )
+
+            # --- Non-variant purchase ---
             else:
-                p = item.product
+                p = Product.objects.select_for_update().get(pk=item.product_id)
+
                 if item.quantity > p.quantity:
                     raise ValueError(f"Insufficient stock for {p.name}")
-                p.quantity = p.quantity - item.quantity
+
+                new_qty = int(p.quantity) - int(item.quantity)
+                p.quantity = max(0, new_qty)
+                p.in_stock = p.quantity > 0
+                p.limited_stock = (p.quantity > 0 and p.quantity <= 5)
                 p.save(update_fields=["quantity", "in_stock", "limited_stock"])
 
-            Product.objects.filter(pk=item.product_id).update(sold_count=F("sold_count") + item.quantity)
-
-            vid = getattr(item.product.vendor, "id", None)
-            if vid:
-                vendor_qty[vid]   = vendor_qty.get(vid, 0) + int(item.quantity)
-                vendor_sales[vid] = vendor_sales.get(vid, Decimal("0")) + item.line_total
+            # sold_count always increments
+            Product.objects.filter(pk=item.product_id).update(
+                sold_count=F("sold_count") + item.quantity
+            )
 
         self.status = "confirmed"
         self.save(update_fields=["status"])
-
-        for vid, q in vendor_qty.items():
-            Vendor.objects.filter(id=vid).update(
-                total_units_sold=F("total_units_sold") + q,
-                total_revenue=F("total_revenue") + vendor_sales.get(vid, Decimal("0"))
-            )
-
 
 # ─────── Visits / Contact ───────
 class VisitEvent(TimeStampedMixin):

@@ -11,8 +11,7 @@ router.register(r"variants", views.ProductVariantViewSet, basename="variant")
 router.register(r"variant-images", views.VariantImageViewSet, basename="variantimage")
 router.register(r"carts", views.CartViewSet, basename="cart")
 router.register(r"orders", views.OrderViewSet, basename="order")
-
-# 🔧 remove stray spaces after `views.`
+router.register(r"suppliers", views.SupplierViewSet, basename="supplier")
 router.register(r"stores", views.StoreViewSet, basename="store")
 router.register(r"vendors", views.VendorViewSet, basename="vendor")
 
@@ -42,12 +41,18 @@ router.register(r"certifications", views.CertificationViewSet, basename="certifi
 router.register(r"gallery", views.GalleryItemViewSet, basename="gallery-item")
 
 urlpatterns = [
+    # ✅ DRF router
     path("api/", include(router.urls)),
 
     # 🔐 custom email-based auth endpoints
     path("api/auth/token/", views.EmailObtainAuthToken.as_view(), name="auth-token"),
     path("api/auth/register/", views.RegisterView.as_view(), name="auth-register"),
-    path("api/auth/me/", views.MeView.as_view(), name="auth-me"),  # ← NEW
+    path("api/auth/me/", views.MeView.as_view(), name="auth-me"),
+
+    # ✅ Forgot password (APIView classes must use as_view())
+    path("api/auth/password-reset/", views.PasswordResetRequestView.as_view(), name="password-reset"),
+    path("api/auth/password-reset/confirm/", views.PasswordResetConfirmView.as_view(), name="password-reset-confirm"),
+
     # 📊 analytics
     path("api/analytics/sales-series/", views.SalesSeriesView.as_view(), name="sales-series"),
     path("api/analytics/kpis/", views.DashboardKpiView.as_view(), name="analytics-kpis"),

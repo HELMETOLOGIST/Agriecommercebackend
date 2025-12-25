@@ -1,5 +1,6 @@
 from decimal import Decimal
-from django.db.models import F, Sum, Count
+import os
+from django.db.models import F, Sum, Count, Q , Value , IntegerField
 from rest_framework import viewsets, permissions, status, filters
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -9,7 +10,12 @@ from rest_framework.parsers import JSONParser, FormParser, MultiPartParser
 from django_filters.rest_framework import DjangoFilterBackend
 from django.shortcuts import get_object_or_404
 from django.conf import settings
+from django.core.mail import send_mail
 import hmac
+from django.core.cache import cache
+from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
+from django.utils.encoding import force_bytes, force_str
+from django.contrib.auth.tokens import default_token_generator
 from django.db.models.functions import TruncDay, TruncWeek, TruncMonth
 import hashlib
 from django.core.exceptions import ValidationError as DjangoValidationError
@@ -23,6 +29,7 @@ from rest_framework.permissions import AllowAny
 from rest_framework.authentication import BaseAuthentication
 from rest_framework.exceptions import ValidationError
 from .models import *
+from datetime import datetime, timedelta, date
 from .serializers import *
 from django.core.validators import validate_email
 from django.core.exceptions import ValidationError as DjangoValidationError
@@ -32,13 +39,51 @@ from rest_framework.authtoken.views import ObtainAuthToken
 from django.core.mail import EmailMultiAlternatives
 from django.template.defaultfilters import linebreaksbr, floatformat
 from django.utils.html import escape
+from rest_framework.authentication import TokenAuthentication
 from django.contrib.auth import get_user_model
+from django.db.models.functions import Coalesce
 User = get_user_model()
 # ---------- country helper ----------
 
 def _country_code(request):
     return (request.headers.get("X-Country-Code") or request.query_params.get("country") or "IN").upper()
+def _parse_notify_emails():
+    raw = (
+        getattr(settings, "BACKEND_NOTIFY_EMAILS", "") or
+        getattr(settings, "CONTACT_NOTIFY_EMAILS", "") or
+        getattr(settings, "JOB_NOTIFY_EMAILS", "") or
+        ""
+    )
+    if isinstance(raw, str) and raw.strip():
+        return [x.strip() for x in raw.split(",") if x.strip()]
+    # fallback
+    return [getattr(settings, "DEFAULT_FROM_EMAIL", "")] if getattr(settings, "DEFAULT_FROM_EMAIL", "") else []
 
+def _maybe_send_product_alert_email(low_stock_rows: list[dict], expiring_rows: list[dict]):
+    """
+    low_stock_rows: [{id, name, stock}]
+    expiring_rows: [{id, name, expiry_date, days_left}]
+    """
+    if not low_stock_rows and not expiring_rows:
+        return
+
+    lines: list[str] = []
+    lines.append("Admin Product Alerts\n")
+
+    if low_stock_rows:
+        lines.append("Low stock (<= 5):")
+        for r in low_stock_rows:
+            lines.append(f" - {r.get('name')} (stock: {r.get('stock')})")
+        lines.append("")
+
+    if expiring_rows:
+        lines.append("Expiring soon (<= 5 days):")
+        for r in expiring_rows:
+            lines.append(f" - {r.get('name')} (expires: {r.get('expiry_date')} / {r.get('days_left')} days left)")
+        lines.append("")
+
+    subject = "Admin Alert: Low stock / Expiring products"
+    _email_once("admin_product_alerts_daily_v1", subject, "\n".join(lines))
 # ---------- permissions ----------
 def _from_email():
     return getattr(settings, "DEFAULT_FROM_EMAIL", None) or getattr(settings, "EMAIL_HOST_USER", None) or "no-reply@example.com"
@@ -48,15 +93,37 @@ def _split_csv_emails(value: str | None):
         return []
     return [e.strip() for e in str(value).replace(";", ",").split(",") if e.strip()]
 
-def _admin_recipients():
-    # try BACKEND_NOTIFY_EMAILS first; fallback to CONTACT_NOTIFY_EMAILS / LEAD_NOTIFY_EMAILS
-    for key in ("BACKEND_NOTIFY_EMAILS", "CONTACT_NOTIFY_EMAILS", "LEAD_NOTIFY_EMAILS"):
-        emails = _split_csv_emails(getattr(settings, key, None))
-        if emails:
-            return emails
-    # last resort: project email itself
-    fallback = getattr(settings, "DEFAULT_FROM_EMAIL", None) or getattr(settings, "EMAIL_HOST_USER", None)
-    return [fallback] if fallback else []
+def _admin_recipients() -> list[str]:
+    """
+    Add all admin notify targets (from .env).
+    Keep simple: comma separated emails.
+    """
+    raw = (os.environ.get("BACKEND_NOTIFY_EMAILS") or "").strip()
+    if not raw:
+        raw = (os.environ.get("CONTACT_NOTIFY_EMAILS") or "").strip()
+    if not raw:
+        raw = (os.environ.get("LEAD_NOTIFY_EMAILS") or "").strip()
+    if not raw:
+        return []
+    return [e.strip() for e in raw.split(",") if e.strip()]
+
+def _send_admin_email(subject: str, text: str, html: str | None = None):
+    """
+    Safe admin email sender (does NOT conflict with the later order-email _send_email()).
+    """
+    to_list = _admin_recipients()
+    if not to_list:
+        return
+    try:
+        if html:
+            msg = EmailMultiAlternatives(subject, text, _from_email(), to_list)
+            msg.attach_alternative(html, "text/html")
+            msg.send(fail_silently=True)
+        else:
+            send_mail(subject, text, _from_email(), to_list, fail_silently=True)
+    except Exception:
+        # don't crash the request
+        pass
 
 def _abs(req, path_or_url: str | None):
     """Best-effort absolute URL for images/links in emails."""
@@ -120,6 +187,159 @@ def _collect_line_items_for_email(order, request):
         })
     return out
 
+
+def _product_expiry_date(p) -> Optional[date]:
+    """
+    expiry = manufacture_date + shelf_life_days
+    """
+    mfg = getattr(p, "manufacture_date", None)
+    days = getattr(p, "shelf_life_days", None)
+    if not mfg or not days:
+        return None
+    try:
+        return mfg + timedelta(days=int(days))
+    except Exception:
+        return None
+
+def _product_total_stock(p) -> int:
+    """
+    If variants exist -> sum active variant quantities
+    Else -> product.quantity
+    """
+    try:
+        if hasattr(p, "variants") and p.variants.exists():
+            s = p.variants.filter(is_active=True).aggregate(t=Sum("quantity"))["t"] or 0
+            return int(s)
+    except Exception:
+        pass
+
+    try:
+        return int(getattr(p, "quantity", 0) or 0)
+    except Exception:
+        return 0
+
+def _email_once(cache_key: str, subject: str, text: str, html: str | None = None, ttl_seconds: int = 24 * 3600):
+    """
+    Send admin email only once per ttl window (default 24 hours).
+    FIX: previously this called the wrong _send_email() signature. :contentReference[oaicite:7]{index=7}
+    """
+    try:
+        if cache.get(cache_key):
+            return
+        _send_admin_email(subject, text=text, html=html)
+        cache.set(cache_key, True, ttl_seconds)
+    except Exception:
+        pass
+
+class AdminNotificationsView(APIView):
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        today = timezone.localdate()
+        limit = int(request.query_params.get("limit", "80"))
+
+        items = []
+
+        # ---------------- expiry alerts (<=5 days OR expired) ----------------
+        exp_qs = Product.objects.filter(
+            is_published=True,
+            manufacture_date__isnull=False,
+            shelf_life_days__isnull=False,
+        ).only("id", "name", "manufacture_date", "shelf_life_days", "updated_at")
+
+        for p in exp_qs:
+            exp = _product_expiry_date(p)
+            if not exp:
+                continue
+
+            days_left = (exp - today).days
+            if days_left > 5:
+                continue
+
+            if days_left < 0:
+                title = f"Expired {-days_left} day(s) ago: {p.name} (Expiry {exp.isoformat()})"
+                priority = 0
+            elif days_left == 0:
+                title = f"Expires today: {p.name} (Expiry {exp.isoformat()})"
+                priority = 1
+            else:
+                title = f"Expiring in {days_left} day(s): {p.name} (Expiry {exp.isoformat()})"
+                priority = 2
+
+            key = f"inv-expiry-{p.id}-{exp.isoformat()}"
+            href = f"/admin/products/{p.id}"
+
+            items.append({
+                "key": key,
+                "kind": "expiry",
+                "title": title,
+                "href": href,
+                "created_at": timezone.now().isoformat(),
+                "_priority": priority,
+            })
+
+            # email once/day per product+expiry date
+            _email_once(
+                f"email:{key}",
+                f"[Expiry Alert] {p.name}",
+                f"{title}\nOpen: {href}",
+                None,
+            )
+
+        # ---------------- stock alerts (<=5 incl 0) ----------------
+        stock_qs = Product.objects.filter(is_published=True).prefetch_related("variants").only("id", "name", "quantity", "updated_at")
+
+        for p in stock_qs:
+            qty = _product_total_stock(p)
+            if qty > 5:
+                continue
+
+            if qty == 0:
+                title = f"Out of stock: {p.name}"
+                priority = 0
+            else:
+                title = f"Low stock ({qty} left): {p.name}"
+                priority = 1
+
+            key = f"inv-stock-{p.id}-{qty}"
+            href = f"/admin/products/{p.id}"
+
+            items.append({
+                "key": key,
+                "kind": "stock",
+                "title": title,
+                "href": href,
+                "created_at": timezone.now().isoformat(),
+                "_priority": priority,
+            })
+
+            _email_once(
+                f"email:{key}",
+                f"[Stock Alert] {p.name} ({qty} left)",
+                f"{title}\nOpen: {href}",
+                None,
+            )
+
+        # sort: priority -> newest
+        items.sort(key=lambda x: (x.get("_priority", 9), x.get("title", "")))
+        for it in items:
+            it.pop("_priority", None)
+
+        # buckets for your AdminTopbar dropdown :contentReference[oaicite:5]{index=5}
+        stock_count = sum(1 for i in items if i["kind"] == "stock")
+        exp_count = sum(1 for i in items if i["kind"] == "expiry")
+
+        buckets = [
+            {"key": "inventory", "label": "Inventory Alerts", "href": "/admin/notifications", "count": len(items)},
+            {"key": "stock", "label": "Low / Out of Stock", "href": "/admin/notifications", "count": stock_count},
+            {"key": "expiry", "label": "Expiry (≤ 5 days)", "href": "/admin/notifications", "count": exp_count},
+        ]
+
+        return Response({
+            "total": min(len(items), limit),
+            "buckets": buckets,
+            "flat": items[:limit],
+        })
 def _render_order_email_parts(order, request, heading_for_customer=True):
     """Return (subject, text_body, html_body)."""
     prefix = _currency_prefix(order)
@@ -479,6 +699,136 @@ class IsAdminOrVendorOwner(permissions.BasePermission):
 
         return _vendor_user_id(obj) == getattr(request.user, "id", None)
 
+
+def _frontend_base(request):
+    """
+    Choose frontend base URL for email link.
+    Priority:
+      1) settings.FRONTEND_URL
+      2) Origin header (useful in dev)
+      3) request.build_absolute_uri('/') fallback
+    """
+    base = (getattr(settings, "FRONTEND_URL", "") or "").strip().rstrip("/")
+    if base:
+        return base
+    origin = (request.headers.get("Origin") or "").strip().rstrip("/")
+    if origin:
+        return origin
+    try:
+        return request.build_absolute_uri("/").rstrip("/")
+    except Exception:
+        return ""
+
+class PasswordResetRequestSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+
+class PasswordResetConfirmSerializer(serializers.Serializer):
+    uid = serializers.CharField()
+    token = serializers.CharField()
+    new_password = serializers.CharField(min_length=6)
+
+class PasswordResetRequestView(APIView):
+    """
+    POST { "email": "user@example.com" }
+    Always returns 200 { ok: true } (prevents email enumeration).
+    """
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        ser = PasswordResetRequestSerializer(data=request.data)
+        if not ser.is_valid():
+            # still return ok:true to avoid enumeration / consistent UX
+            return Response({"ok": True}, status=200)
+
+        email = (ser.validated_data.get("email") or "").strip().lower()
+
+        # Validate email format (best-effort)
+        try:
+            validate_email(email)
+        except Exception:
+            return Response({"ok": True}, status=200)
+
+        user = User.objects.filter(email__iexact=email).first()
+
+        # Always return ok:true (don’t reveal if user exists)
+        if not user or not user.is_active:
+            return Response({"ok": True}, status=200)
+
+        # Create reset uid + token
+        uidb64 = urlsafe_base64_encode(force_bytes(user.pk))
+        token = default_token_generator.make_token(user)
+
+        # Your frontend route is the SAME login page component:
+        # /reset-password/:uid/:token
+        base = _frontend_base(request)
+        reset_link = f"{base}/reset-password/{uidb64}/{token}"
+
+        try:
+            subj = "Reset your password"
+            when = timezone.localtime().strftime("%Y-%m-%d %H:%M")
+            text = (
+                f"We received a request to reset your password.\n\n"
+                f"Reset link:\n{reset_link}\n\n"
+                f"If you didn’t request this, ignore this email.\n"
+                f"Time: {when}\n"
+            )
+            html = f"""
+            <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Helvetica,Arial,sans-serif;line-height:1.5">
+              <h3 style="margin:0 0 10px">Reset your password</h3>
+              <p>We received a request to reset your password.</p>
+              <p style="margin:14px 0">
+                <a href="{escape(reset_link)}"
+                   style="display:inline-block;background:#16a34a;color:#fff;text-decoration:none;padding:10px 14px;border-radius:10px">
+                  Reset Password
+                </a>
+              </p>
+              <p style="color:#555">If you didn’t request this, ignore this email.</p>
+              <div style="margin-top:12px;color:#777;font-size:12px">Time: {escape(when)}</div>
+            </div>
+            """
+            _send_email(subj, [user.email], text, html)
+        except Exception:
+            pass
+
+        return Response({"ok": True}, status=200)
+
+
+class PasswordResetConfirmView(APIView):
+    """
+    POST { "uid": "<uidb64>", "token": "<token>", "new_password": "secret123" }
+    """
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        ser = PasswordResetConfirmSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+
+        uidb64 = ser.validated_data["uid"]
+        token = ser.validated_data["token"]
+        new_password = ser.validated_data["new_password"]
+
+        try:
+            uid = force_str(urlsafe_base64_decode(uidb64))
+            user = User.objects.get(pk=uid)
+        except Exception:
+            return Response({"detail": "Invalid reset link"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not user.is_active:
+            return Response({"detail": "User is disabled"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not default_token_generator.check_token(user, token):
+            return Response({"detail": "Reset link expired or invalid"}, status=status.HTTP_400_BAD_REQUEST)
+
+        user.set_password(new_password)
+        user.save(update_fields=["password"])
+
+        # Force logout everywhere (recommended): delete DRF tokens
+        Token.objects.filter(user=user).delete()
+
+        return Response({"ok": True}, status=200)
+
 # ---------- simple sets ----------
 class SalesSeriesView(APIView):
     permission_classes = [IsAdminUser]  # make AllowAny if you want it public
@@ -653,7 +1003,7 @@ class CategoryViewSet(viewsets.ModelViewSet):
 class ProductViewSet(viewsets.ModelViewSet):
     queryset = (
         Product.objects
-        .select_related("category", "vendor", "store")
+        .select_related("category", "vendor", "store", "supplier")
         .prefetch_related("images", "variants", "options", "specifications")
         .all()
     )
@@ -734,6 +1084,66 @@ class ProductViewSet(viewsets.ModelViewSet):
                 sort_order=spec.get("sort_order") or i,
             )
         return Response({"ok": True})
+    
+    @action(detail=False, methods=["get"], permission_classes=[permissions.IsAdminUser])
+    def alerts(self, request):
+        """
+        Returns:
+          - low_stock: products where TOTAL stock (variants sum or product qty) <= 5
+          - expiring: products where (manufacture_date + shelf_life_days) is within next 5 days
+        If ?notify=1 -> also emails admin ONCE per day.
+        """
+        today = timezone.localdate()
+        until = today + timedelta(days=5)
+
+        qs = Product.objects.filter(is_published=True)
+
+        # --- LOW STOCK (variants-aware) ---
+        qs_stock = qs.annotate(
+            variant_stock=Sum("variants__quantity", filter=Q(variants__is_active=True)),
+        ).annotate(
+            total_stock=Coalesce(F("variant_stock"), F("quantity"), Value(0), output_field=IntegerField()),
+        )
+
+        low_qs = qs_stock.filter(total_stock__lte=5).order_by("total_stock", "id")[:200]
+        low_rows = [
+            {"id": p.id, "name": p.name, "stock": int(getattr(p, "total_stock", 0) or 0)}
+            for p in low_qs
+        ]
+
+        # --- EXPIRING SOON (manufacture_date + shelf_life_days) ---
+        exp_candidates = qs.filter(
+            is_perishable=True,
+            manufacture_date__isnull=False,
+            shelf_life_days__isnull=False,
+        ).only("id", "name", "manufacture_date", "shelf_life_days")[:2000]
+
+        exp_rows: list[dict] = []
+        for p in exp_candidates:
+            exp = _product_expiry_date(p)
+            if not exp:
+                continue
+            if today <= exp <= until:
+                exp_rows.append({
+                    "id": p.id,
+                    "name": p.name,
+                    "expiry_date": exp.isoformat(),
+                    "days_left": (exp - today).days,
+                })
+
+        exp_rows.sort(key=lambda r: (r["days_left"], r["id"]))
+        exp_rows = exp_rows[:200]
+
+        # --- optional email ---
+        notify = str(request.query_params.get("notify", "0")).lower() in ("1", "true", "yes")
+        if notify:
+            _maybe_send_product_alert_email(low_rows, exp_rows)
+
+        return Response({
+            "generated_at": timezone.now().isoformat(),
+            "low_stock": low_rows,
+            "expiring": exp_rows,
+        })
 
     @action(detail=True, methods=["post"], permission_classes=[IsAdminOrVendorOwner])
     def upsert_variants(self, request, pk=None):
@@ -1051,183 +1461,235 @@ class CartViewSet(viewsets.ModelViewSet):
         return Response({"ok": True, "removed": True})
 
 
+def _country_code(request) -> str:
+    # keep your existing helper if you have one
+    return "IN"
+
 
 class OrderViewSet(viewsets.ModelViewSet):
-    permission_classes = [permissions.IsAuthenticated]
     serializer_class = OrderSerializer
 
-    def _base_queryset(self):
-        return (
-            Order.objects
-            .select_related("cart", "user")
-            .prefetch_related(
-                "cart__items",
-                "cart__items__product",
-                "cart__items__product__category",
-                "cart__items__variant",
-                "cart__items__variant__images",
-            )
-            .order_by("-created_at")
-        )
+    MIN_ORDER_SUBTOTAL = Decimal("100.00")
+    DELIVERY_FEE = Decimal("50.00")
 
-    queryset = None
+    def get_permissions(self):
+        # allow guest checkout for COD and Razorpay confirm if you want
+        if getattr(self, "action", None) in ("cod", "razorpay_confirm"):
+            return [permissions.AllowAny()]
+        return [permissions.IsAuthenticated()]
+
+    # ✅ CSRF-safe: force TokenAuthentication for COD / Razorpay confirm actions
+    def get_authenticators(self):
+        if getattr(self, "action", None) in ("cod", "razorpay_confirm"):
+            return [TokenAuthentication()]
+        return super().get_authenticators()
 
     def get_queryset(self):
-        qs = self._base_queryset()
+        qs = (
+            Order.objects.select_related("cart", "user")
+            .prefetch_related("cart__items", "cart__items__product", "cart__items__variant")
+            .order_by("-created_at")
+        )
         user = self.request.user
+        mine = str(self.request.query_params.get("mine", "")).lower() in ("1", "true", "yes")
 
-        # Normalize ?mine flag
-        mine_raw = str(self.request.query_params.get("mine", "")).strip().lower()
-        mine = mine_raw in ("1", "true", "yes")
-
-        # Own orders explicitly
         if mine:
             return qs.filter(user=user)
 
-        # Staff sees all
         if user.is_authenticated and (user.is_staff or user.is_superuser):
             return qs
 
-        # Normal users see only theirs
         return qs.filter(user=user)
 
-    # ---------- helpers ----------
-    def _get_or_create_guest_user(self, data: dict) -> "User":
-        email = (data.get("email") or "").strip().lower()
-        first = (data.get("firstName") or "").strip()
-        last  = (data.get("lastName") or "").strip()
-        if not email:
-            raise ValidationError("Email is required")
-        try:
-            validate_email(email)
-        except DjangoValidationError:
-            raise ValidationError("Invalid email")
+    # ---------------- helpers ----------------
 
-        user, created = User.objects.get_or_create(
-            email=email, defaults={"first_name": first, "last_name": last, "is_active": True}
-        )
-        if created:
-            user.set_unusable_password()
-            user.save(update_fields=["password", "first_name", "last_name"])
-        else:
-            updates = {}
-            if first and not user.first_name: updates["first_name"] = first
-            if last and not user.last_name:   updates["last_name"]  = last
-            if updates:
-                for k, v in updates.items():
-                    setattr(user, k, v)
-                user.save(update_fields=list(updates.keys()))
+    def _get_or_create_guest_user(self, data: dict):
+        """
+        Uses your existing guest-user logic.
+        If you already have this in views.py, keep yours and remove this.
+        """
+        email = (data.get("email") or "").strip().lower()
+        if not email:
+            raise ValueError("Email required")
+
+        user = User.objects.filter(email=email).first()
+        if user:
+            return user
+
+        first = (data.get("firstName") or "").strip()
+        last = (data.get("lastName") or "").strip()
+
+        user = User.objects.create(email=email, first_name=first, last_name=last, is_active=True)
+        user.set_unusable_password()
+        user.save(update_fields=["password"])
         return user
 
-    def _ensure_cart(self, user: "User") -> "Cart":
-        cart = Cart.objects.filter(user=user, checked_out=False).first()
+    def _ensure_cart(self, user):
+        """
+        ✅ Critical fix:
+        pick cart that is NOT checked_out AND NOT already attached to an Order
+        (prevents UNIQUE constraint on Order.cart_id)
+        """
+        cart = (
+            Cart.objects
+            .filter(user=user, checked_out=False)
+            .exclude(order__isnull=False)  # if reverse exists
+            .first()
+        )
+
+        # If reverse name isn't "order", above exclude might fail in some schemas.
+        # So we use a safer fallback below.
+        if cart and Order.objects.filter(cart=cart).exists():
+            cart = None
+
         if not cart:
             cart = Cart.objects.create(user=user, checked_out=False)
         return cart
 
-    def _clean_int(self, v, default=0):
-        try:
-            return int(v)
-        except Exception:
-            return default
-
-    def _upsert_cart_items_from_lines(self, cart: "Cart", lines) -> None:
+    def _upsert_cart_items_from_lines(self, cart, lines):
+        """
+        lines expected like:
+        [{product_id, variant_id?, qty/quantity, ...}]
+        """
         if not isinstance(lines, list):
             return
+
         for ln in lines:
-            pid = self._clean_int(ln.get("product_id"), 0)
-            vid = ln.get("variant_id")
-            qty = self._clean_int(ln.get("quantity") or ln.get("qty"), 0)
-            if pid <= 0 or qty <= 0:
-                continue
             try:
-                product = Product.objects.get(pk=pid)
-            except Product.DoesNotExist:
+                pid = int(ln.get("product_id") or 0)
+            except Exception:
+                pid = 0
+
+            if pid <= 0:
                 continue
+
+            qty = ln.get("quantity", ln.get("qty", 0))
+            try:
+                qty = int(qty)
+            except Exception:
+                qty = 0
+
+            if qty <= 0:
+                continue
+
+            product = Product.objects.filter(pk=pid).first()
+            if not product:
+                continue
+
             variant = None
+            vid = ln.get("variant_id", None)
             if vid not in (None, "", "null"):
                 try:
-                    variant = ProductVariant.objects.get(pk=int(vid), product_id=pid)
-                except (ProductVariant.DoesNotExist, ValueError, TypeError):
+                    variant = ProductVariant.objects.filter(pk=int(vid), product_id=pid).first()
+                except Exception:
                     variant = None
-            obj, created = CartItem.objects.get_or_create(
-                cart=cart, product=product, variant=variant, defaults={"quantity": qty}
+
+            item, created = CartItem.objects.get_or_create(
+                cart=cart, product=product, variant=variant,
+                defaults={"quantity": qty}
             )
             if not created:
-                new_qty = obj.quantity + qty
-                if new_qty > 0:
-                    obj.quantity = new_qty
-                    obj.save(update_fields=["quantity"])
-                else:
-                    obj.delete()
+                item.quantity = item.quantity + qty
+                item.save(update_fields=["quantity"])
 
-    # ---------- CREATE / EMAIL ----------
-    def perform_create(self, serializer):
-        order = serializer.save(
-            user=self.request.user,
-            status="pending",
-            shipment_status="pending",
-        )
-        if getattr(order, "cart", None):
-            order.cart.checked_out = True
-            order.cart.save(update_fields=["checked_out"])
-        send_order_emails(order, self.request)
+    def _product_default_grams_equiv(self, product):
+        """
+        Convert default_pack_qty + default_uom to grams/ml equivalent.
+        KG -> *1000, L -> *1000
+        """
+        try:
+            qty = Decimal(str(getattr(product, "default_pack_qty", "") or "0"))
+        except Exception:
+            return None
 
-    # ---------- CONFIRM ----------
+        uom = (getattr(product, "default_uom", "") or "").strip().upper()
+        if qty <= 0:
+            return None
+
+        if uom == "KG":
+            return qty * Decimal("1000")
+        if uom == "G":
+            return qty
+
+        if uom in ("L", "LT", "LITER", "LITRE"):
+            return qty * Decimal("1000")
+        if uom == "ML":
+            return qty
+
+        return None
+
+    def _cart_compute_totals(self, cart, country_code="IN"):
+        """
+        subtotal: sum(unit price * qty)
+        shipping: ₹50 if ANY item pack > 1000g or 1000ml (above 1kg/1L)
+        """
+        subtotal = Decimal("0.00")
+        need_delivery = False
+
+        items = cart.items.select_related("product", "variant").all()
+
+        for it in items:
+            qty = int(getattr(it, "quantity", 0) or 0)
+            if qty <= 0:
+                continue
+
+            product = it.product
+            variant = getattr(it, "variant", None)
+
+            # unit price – safe fallbacks
+            unit = None
+            if variant is not None and hasattr(variant, "unit_price_for_country"):
+                unit = variant.unit_price_for_country(country_code)
+            elif hasattr(product, "discounted_price_for_country"):
+                unit = product.discounted_price_for_country(country_code)
+            else:
+                unit = getattr(product, "price", 0)
+
+            try:
+                unit_dec = Decimal(str(unit or "0"))
+            except Exception:
+                unit_dec = Decimal("0")
+
+            subtotal += unit_dec * qty
+
+            # delivery rule
+            if not need_delivery:
+                grams_equiv = None
+                if variant is not None and hasattr(variant, "grams_equivalent"):
+                    try:
+                        grams_equiv = Decimal(str(variant.grams_equivalent() or "0"))
+                    except Exception:
+                        grams_equiv = None
+                if grams_equiv is None:
+                    grams_equiv = self._product_default_grams_equiv(product)
+                try:
+                    if grams_equiv is not None and grams_equiv > Decimal("1000"):
+                        need_delivery = True
+                except Exception:
+                    pass
+
+        shipping = self.DELIVERY_FEE if need_delivery else Decimal("0.00")
+        subtotal = subtotal.quantize(Decimal("0.01"))
+        shipping = shipping.quantize(Decimal("0.01"))
+        grand_total = (subtotal + shipping).quantize(Decimal("0.01"))
+        return subtotal, shipping, grand_total
+
+    # ---------------- actions ----------------
+
     @action(detail=True, methods=["post"])
     @transaction.atomic
     def confirm(self, request, pk=None):
         order = self.get_object()
-
-        # 1) Confirm order + decrement stock, but never crash API
         try:
             if hasattr(order, "confirm_and_decrement_stock"):
                 order.confirm_and_decrement_stock()
             else:
-                # Fallback: just mark confirmed if method not present
                 if order.status != "confirmed":
                     order.status = "confirmed"
                     order.save(update_fields=["status"])
         except Exception as e:
-            # If stock op fails, still move to confirmed? choose policy:
-            # Here we confirm but log & notify admin, and continue.
-            order.status = "confirmed"
-            order.save(update_fields=["status"])
-            try:
-                _send_email(
-                    f"[Admin] Order #{order.id} confirm_and_decrement_stock() failed",
-                    _admin_recipients(),
-                    f"Exception: {e}",
-                    None,
-                )
-            except Exception:
-                pass
+            return Response({"ok": False, "detail": str(e)}, status=409)
 
-        # 2) Mark COD payments as paid (robust payment lookup)
-        pay = getattr(order, "payment", None)
-        if not pay:
-            pay = (
-                OrderPayment.objects.filter(order=order)
-                .order_by("-created_at")
-                .first()
-            )
-
-        def _lower(x): return (str(x or "")).strip().lower()
-
-        is_cod = False
-        if pay:
-            is_cod = (
-                _lower(pay.method) == "cash-on-delivery"
-                or _lower(pay.provider) in ("cod", "cash-on-delivery")
-            )
-        else:
-            is_cod = _lower(order.payment_method) in ("cash-on-delivery", "cod")
-
-        if pay and is_cod and _lower(pay.status) != "paid":
-            pay.status = "paid"
-            pay.save(update_fields=["status"])
-
-        # 3) Send emails (best-effort)
         try:
             send_order_emails(order, request)
         except Exception:
@@ -1236,47 +1698,105 @@ class OrderViewSet(viewsets.ModelViewSet):
         ser = self.get_serializer(order)
         return Response(ser.data, status=200)
 
-    # ---------- COD ----------
-    @action(detail=False, methods=["post"], permission_classes=[permissions.AllowAny])
+    # ✅ COD — FIXED
+    @action(detail=False, methods=["post"])
     @transaction.atomic
     def cod(self, request):
         data = request.data or {}
-        user = request.user if (request.user and request.user.is_authenticated) else self._get_or_create_guest_user(data)
+
+        user = (
+            request.user
+            if (request.user and request.user.is_authenticated)
+            else self._get_or_create_guest_user(data)
+        )
+
         cart = self._ensure_cart(user)
+
+        # ✅ if any order already exists for this cart, rotate cart
+        if Order.objects.filter(cart=cart).exists():
+            Cart.objects.filter(pk=cart.pk).update(checked_out=True)
+            cart = Cart.objects.create(user=user, checked_out=False)
+
         client_lines = data.get("lines") or []
         self._upsert_cart_items_from_lines(cart, client_lines)
 
+        cc = _country_code(request)
+        subtotal, shipping, grand_total = self._cart_compute_totals(cart, cc)
+
+        if subtotal < self.MIN_ORDER_SUBTOTAL:
+            return Response(
+                {
+                    "ok": False,
+                    "detail": f"Minimum order amount is ₹{self.MIN_ORDER_SUBTOTAL}",
+                    "computed_totals": {
+                        "subtotal": str(subtotal),
+                        "shipping": str(shipping),
+                        "grand_total": str(grand_total),
+                    },
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         order = Order.objects.create(
-            user=user, cart=cart, status="pending", shipment_status="pending",
-            payment_method="cash-on-delivery", country_code="IN", currency="INR",
+            user=user,
+            cart=cart,
+            status="pending",
+            shipment_status="pending",
+            payment_method="cash-on-delivery",
+            country_code=cc,
+            currency="INR",
         )
 
-        full_name = (f"{data.get('firstName','').strip()} {data.get('lastName','').strip()}".strip()
-                     or user.get_full_name() or user.email)
+        full_name = (
+            f"{(data.get('firstName') or '').strip()} {(data.get('lastName') or '').strip()}".strip()
+            or getattr(user, "get_full_name", lambda: "")()
+            or user.email
+        )
+
         OrderCheckoutDetails.objects.create(
             order=order,
             full_name=full_name,
-            email=data.get("email",""),
-            phone=data.get("phone",""),
-            address1=data.get("address",""),
-            address2=data.get("address2",""),
-            city=data.get("city",""),
-            state=data.get("state",""),
-            postcode=data.get("zipCode",""),
-            country=data.get("country","India") or "India",
+            email=data.get("email", ""),
+            phone=data.get("phone", ""),
+            address1=data.get("address", ""),
+            address2=data.get("address2", ""),
+            city=data.get("city", ""),
+            state=data.get("state", ""),
+            postcode=data.get("zipCode", ""),
+            country=data.get("country", "India") or "India",
             notes=(data.get("notes") or ""),
         )
 
-        totals = data.get("totals") or {}
         OrderPayment.objects.create(
-            order=order, method="cash-on-delivery", provider="cod", status="pending",
-            transaction_id="", currency="INR",
-            amount=Decimal(str(totals.get("grand_total") or totals.get("total") or 0)),
-            raw={"lines": client_lines, "totals": totals},
+            order=order,
+            method="cash-on-delivery",
+            provider="cod",
+            status="pending",
+            transaction_id="",
+            currency="INR",
+            amount=grand_total,
+            raw={
+                "lines": client_lines,
+                "computed_totals": {
+                    "subtotal": str(subtotal),
+                    "shipping": str(shipping),
+                    "grand_total": str(grand_total),
+                },
+            },
         )
 
         cart.checked_out = True
         cart.save(update_fields=["checked_out"])
+
+        # ✅ IMPORTANT: decrease stock on COD too
+        try:
+            if hasattr(order, "confirm_and_decrement_stock"):
+                order.confirm_and_decrement_stock()
+            else:
+                order.status = "confirmed"
+                order.save(update_fields=["status"])
+        except Exception as e:
+            return Response({"ok": False, "detail": str(e)}, status=409)
 
         try:
             send_order_emails(order, request)
@@ -1284,16 +1804,28 @@ class OrderViewSet(viewsets.ModelViewSet):
             pass
 
         ser = self.get_serializer(order)
-        return Response({"ok": True, "order": ser.data}, status=201)
+        return Response(
+            {
+                "ok": True,
+                "order": ser.data,
+                "computed_totals": {
+                    "subtotal": str(subtotal),
+                    "shipping": str(shipping),
+                    "grand_total": str(grand_total),
+                },
+            },
+            status=201,
+        )
 
-    # ---------- Razorpay ----------
-     # ---------- Razorpay ----------
-    @action(detail=False, methods=["post"], permission_classes=[permissions.AllowAny])
+    # ✅ Razorpay confirm (kept compatible with your existing endpoints)
+    @action(detail=False, methods=["post"])
     @transaction.atomic
     def razorpay_confirm(self, request):
-        rp_order_id = (request.data or {}).get("razorpay_order_id")
-        rp_payment_id = (request.data or {}).get("razorpay_payment_id")
-        checkout = (request.data or {}).get("checkout") or {}
+        payload = request.data or {}
+        rp_order_id = payload.get("razorpay_order_id")
+        rp_payment_id = payload.get("razorpay_payment_id")
+        checkout = payload.get("checkout") or {}
+
         if not rp_order_id or not rp_payment_id:
             return Response({"detail": "razorpay_order_id and razorpay_payment_id required"}, status=400)
 
@@ -1302,26 +1834,37 @@ class OrderViewSet(viewsets.ModelViewSet):
             if (request.user and request.user.is_authenticated)
             else self._get_or_create_guest_user(checkout)
         )
-        cart = self._ensure_cart(user)
-        client_lines = checkout.get("lines") or []
-        self._upsert_cart_items_from_lines(cart, client_lines)
 
-        # --- create base order (status confirmed, shipment pending) ---
+        cart = self._ensure_cart(user)
+        if Order.objects.filter(cart=cart).exists():
+            Cart.objects.filter(pk=cart.pk).update(checked_out=True)
+            cart = Cart.objects.create(user=user, checked_out=False)
+
+        lines = checkout.get("lines") or []
+        self._upsert_cart_items_from_lines(cart, lines)
+
+        cc = _country_code(request)
+        subtotal, shipping, grand_total = self._cart_compute_totals(cart, cc)
+
+        if subtotal < self.MIN_ORDER_SUBTOTAL:
+            return Response({"detail": f"Minimum order amount is ₹{self.MIN_ORDER_SUBTOTAL}"}, status=400)
+
         order = Order.objects.create(
             user=user,
             cart=cart,
             status="confirmed",
             shipment_status="pending",
-            payment_method="card",  # provisional; will override with Razorpay method below
-            country_code="IN",
+            payment_method="card",
+            country_code=cc,
             currency="INR",
         )
 
         full_name = (
-            f"{checkout.get('firstName','').strip()} {checkout.get('lastName','').strip()}".strip()
-            or user.get_full_name()
+            f"{(checkout.get('firstName') or '').strip()} {(checkout.get('lastName') or '').strip()}".strip()
+            or getattr(user, "get_full_name", lambda: "")()
             or user.email
         )
+
         OrderCheckoutDetails.objects.create(
             order=order,
             full_name=full_name,
@@ -1336,35 +1879,25 @@ class OrderViewSet(viewsets.ModelViewSet):
             notes=(checkout.get("notes") or ""),
         )
 
-        # --- Fetch Razorpay payment to know METHOD (upi, card, netbanking...) + exact amount ---
         payment_obj = None
         payment_method = "card"
-        amount_dec = Decimal("0.00")
+        amount_dec = grand_total
 
         try:
             client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET))
             payment_obj = client.payment.fetch(rp_payment_id)
-
-            # e.g. "upi", "card", "netbanking", "wallet", ...
             payment_method = (payment_obj.get("method") or "card").lower()
-
-            # Razorpay sends amount in paise -> convert to rupees
             amt_paise = Decimal(str(payment_obj.get("amount") or "0"))
             amount_dec = (amt_paise / Decimal("100")).quantize(Decimal("0.01"))
         except Exception:
-            # Fallback: use amount from request if provided
-            try:
-                amount_dec = Decimal(str(request.data.get("amount") or 0))
-            except Exception:
-                amount_dec = Decimal("0.00")
+            pass
 
-        # Update order with the actual Razorpay method (upi/card/netbanking/etc.)
         order.payment_method = payment_method
         order.save(update_fields=["payment_method"])
 
         OrderPayment.objects.create(
             order=order,
-            method=payment_method,             # <- upi / card / netbanking / ...
+            method=payment_method,
             provider="razorpay",
             status="paid",
             transaction_id=rp_payment_id,
@@ -1373,35 +1906,24 @@ class OrderViewSet(viewsets.ModelViewSet):
             raw={
                 "razorpay_order_id": rp_order_id,
                 "razorpay_payment_id": rp_payment_id,
-                "razorpay_payment": payment_obj,   # full Razorpay payment payload for debugging
-                "lines": client_lines,
-                "totals": checkout.get("totals") or {},
+                "razorpay_payment": payment_obj,
+                "computed_totals": {
+                    "subtotal": str(subtotal),
+                    "shipping": str(shipping),
+                    "grand_total": str(grand_total),
+                },
             },
         )
 
         cart.checked_out = True
         cart.save(update_fields=["checked_out"])
 
-        # Try stock decrement, but never 500
         try:
             if hasattr(order, "confirm_and_decrement_stock"):
                 order.confirm_and_decrement_stock()
-            else:
-                if order.status != "confirmed":
-                    order.status = "confirmed"
-                    order.save(update_fields=["status"])
         except Exception as e:
             order.status = "pending"
             order.save(update_fields=["status"])
-            try:
-                _send_email(
-                    f"[Admin] Order #{order.id} stock confirmation failed",
-                    _admin_recipients(),
-                    f"Order #{order.id} confirm_and_decrement_stock() raised: {e}",
-                    None,
-                )
-            except Exception:
-                pass
             return Response({"ok": False, "order_id": order.id, "detail": str(e)}, status=409)
 
         try:
@@ -1412,24 +1934,18 @@ class OrderViewSet(viewsets.ModelViewSet):
         ser = self.get_serializer(order)
         return Response({"ok": True, "order": ser.data}, status=201)
 
-    # ---------- shipment quick update ----------
+    # shipment update for staff
     def partial_update(self, request, *args, **kwargs):
         if not request.user.is_staff:
-            return Response({"detail": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
+            return Response({"detail": "Forbidden"}, status=403)
 
         data = request.data or {}
         if "shipment_status" not in data:
             return super().partial_update(request, *args, **kwargs)
 
-        val = str(data["shipment_status"])
-        valid = dict(Order.SHIPMENT_STATUS_CHOICES)
-        if val not in valid:
-            return Response({"detail": "Invalid shipment_status"}, status=status.HTTP_400_BAD_REQUEST)
-
         order = self.get_object()
-        if order.shipment_status != val:
-            order.shipment_status = val
-            order.save(update_fields=["shipment_status"])
+        order.shipment_status = str(data["shipment_status"])
+        order.save(update_fields=["shipment_status"])
 
         ser = self.get_serializer(order)
         return Response(ser.data, status=200)
@@ -1438,12 +1954,8 @@ class OrderViewSet(viewsets.ModelViewSet):
     def set_shipment(self, request, pk=None):
         if not request.user.is_staff:
             return Response({"detail": "Forbidden"}, status=403)
-        val = str((request.data or {}).get("shipment_status") or "")
-        valid = dict(Order.SHIPMENT_STATUS_CHOICES)
-        if val not in valid:
-            return Response({"detail": "Invalid shipment_status"}, status=400)
         order = self.get_object()
-        order.shipment_status = val
+        order.shipment_status = str((request.data or {}).get("shipment_status") or "")
         order.save(update_fields=["shipment_status"])
         return Response({"id": order.id, "shipment_status": order.shipment_status})
 
@@ -1873,3 +2385,73 @@ class GalleryItemViewSet(PublicReadAdminWriteMixin, viewsets.ModelViewSet):
             else:
                 qs = qs.filter(is_active=(active not in ["0", "false", "False"]))
         return qs
+
+class SupplierViewSet(viewsets.ModelViewSet):
+    """
+    Supplier CRUD + metrics:
+      - total_products_supplied
+      - total_quantity_sold
+      - total_orders
+      - total_revenue
+    """
+    serializer_class = SupplierSerializer
+    parser_classes = [JSONParser, FormParser, MultiPartParser]
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+
+    search_fields = [
+        "name",
+        "code",
+        "contact_person",
+        "email",
+        "phone",
+        "gst_number",
+        "city",
+        "state",
+    ]
+    ordering_fields = ["name", "created_at", "updated_at"]
+    ordering = ["name"]
+
+    def get_permissions(self):
+        # read: any authenticated user; write: admin only
+        if self.action in ["list", "retrieve"]:
+            return [permissions.IsAuthenticated()]
+        return [permissions.IsAdminUser()]
+
+    def get_queryset(self):
+        qs = Supplier.objects.all()
+
+        # optional filter: ?only_active=1
+        only_active = (self.request.query_params.get("only_active") or "").strip().lower()
+        if only_active in ("1", "true", "yes"):
+            qs = qs.filter(is_active=True)
+
+        # only CONFIRMED orders for metrics
+        confirmed = Q(products__cartitem__cart__order__status="confirmed")
+
+        qs = qs.annotate(
+            # distinct products for this supplier
+            agg_total_products_supplied=Count("products", distinct=True),
+
+            # sum of quantities on cart items in confirmed orders
+            agg_total_quantity_sold=Sum(
+                "products__cartitem__quantity",
+                filter=confirmed,
+            ),
+
+            # distinct confirmed orders that include this supplier's products
+            agg_total_orders=Count(
+                "products__cartitem__cart__order",
+                filter=confirmed,
+                distinct=True,
+            ),
+
+            # 💥 IMPORTANT: go via order__payment (related_name="payment"), not orderpayment
+            agg_total_revenue=Sum(
+                "products__cartitem__cart__order__payment__amount",
+                filter=confirmed
+                & Q(products__cartitem__cart__order__payment__status="paid"),
+            ),
+        )
+
+        return qs.order_by("name")
+

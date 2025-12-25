@@ -100,6 +100,52 @@ def _parse_dt_safe(v):
     except Exception:
         return None
 # ---------- Basic serializers ----------
+class SupplierSerializer(serializers.ModelSerializer):
+    # Use source= to map public field names to annotation names
+    total_products_supplied = serializers.IntegerField(
+        read_only=True, source="agg_total_products_supplied"
+    )
+    total_quantity_sold = serializers.IntegerField(
+        read_only=True, source="agg_total_quantity_sold"
+    )
+    total_orders = serializers.IntegerField(
+        read_only=True, source="agg_total_orders"
+    )
+    total_revenue = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        read_only=True,
+        required=False,
+        allow_null=True,
+        source="agg_total_revenue",
+    )
+
+    class Meta:
+        model = Supplier
+        fields = [
+            "id",
+            "name",
+            "code",
+            "contact_person",
+            "email",
+            "phone",
+            "address_line1",
+            "address_line2",
+            "city",
+            "state",
+            "postcode",
+            "country",
+            "gst_number",
+            "notes",
+            "is_active",
+            # aggregates
+            "total_products_supplied",
+            "total_quantity_sold",
+            "total_orders",
+            "total_revenue",
+            "created_at",
+            "updated_at",
+        ]
 
 class CategorySerializer(serializers.ModelSerializer):
     class Meta:
@@ -223,6 +269,7 @@ class ProductReadSerializer(serializers.ModelSerializer):
     category = CategorySerializer(read_only=True)
     vendor = VendorSerializer(read_only=True)
     store = StoreSerializer(read_only=True)
+    supplier = SupplierSerializer(read_only=True)
 
     images = ProductImageSerializer(many=True, read_only=True)
     variants = ProductVariantSerializer(many=True, read_only=True)
@@ -238,7 +285,7 @@ class ProductReadSerializer(serializers.ModelSerializer):
         fields = [
             "id", "name", "slug", "description",
             "description_html", "primary_image_url",
-            "category", "vendor", "store",
+            "category", "vendor", "store", "supplier",
             "quantity", "grade", "manufacture_date",
             "origin_country", "warranty_months",
             "price_inr", "price_usd", "price",
@@ -539,6 +586,12 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
     category_id = IDRelatedField(queryset=Category.objects.all(), source="category", required=True, allow_null=False)
     vendor_id   = IDRelatedField(queryset=Vendor.objects.all(),   source="vendor",   required=False, allow_null=True)
     store_id    = IDRelatedField(queryset=Store.objects.all(),    source="store",    required=False, allow_null=True)
+    supplier_id = IDRelatedField(
+        queryset=Supplier.objects.all(),
+        source="supplier",
+        required=False,
+        allow_null=True,
+    )
 
     price_inr   = serializers.CharField(required=False, allow_blank=True, default="0.00")
     gst_rate    = serializers.CharField(required=False, allow_blank=True, allow_null=True, default="0.00")
@@ -553,7 +606,7 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
         model = Product
         fields = [
             "id",  # ✅ include id so create/update responses return the product id
-            "category_id", "vendor_id", "store_id",
+            "category_id", "vendor_id", "store_id", "supplier_id",
             "name", "description", "origin_country", "grade",
             "quantity", "manufacture_date", "is_perishable", "is_organic", "shelf_life_days",
             "default_uom", "default_pack_qty",
@@ -1080,7 +1133,6 @@ class BlogPostSerializer(serializers.ModelSerializer):
         return instance
 
 # --- Carts ---
-
 
 
 

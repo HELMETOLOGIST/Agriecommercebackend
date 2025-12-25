@@ -149,6 +149,7 @@ CSRF_TRUSTED_ORIGINS = [
 RAZORPAY_KEY_ID        = config("RAZORPAY_KEY_ID", default="")
 RAZORPAY_KEY_SECRET    = config("RAZORPAY_KEY_SECRET", default="")
 RAZORPAY_WEBHOOK_SECRET= config("RAZORPAY_WEBHOOK_SECRET", default="")  # optional but recommended
+FRONTEND_URL = "http://localhost:8080"   # OR http://localhost:5173 in dev
 
 
 AUTH_USER_MODEL = "ecommerceapp.User"

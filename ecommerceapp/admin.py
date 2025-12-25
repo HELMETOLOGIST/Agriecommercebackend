@@ -62,6 +62,10 @@ class ColorAdmin(admin.ModelAdmin):
     list_display = ("name","hex")
     search_fields = ("name","hex")
 
+@admin.register(Supplier)
+class SupplierAdmin(admin.ModelAdmin):
+    list_display = ("name","phone")
+   
 # ───────── Category ─────────
 @admin.register(Category)
 class CategoryAdmin(admin.ModelAdmin):
@@ -114,7 +118,7 @@ class ProductAdmin(admin.ModelAdmin):
     fields = (
         # Core
         "category", "name", "slug", "description",
-        "vendor","store",
+        "vendor","store","supplier",
         # Inventory / attributes
         "quantity", "grade", "manufacture_date", "origin_country", "warranty_months",
         # Pricing
