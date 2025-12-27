@@ -254,13 +254,34 @@ class ProductVariantSerializer(serializers.ModelSerializer):
 # ---------- Specifications ----------
 
 class ProductSpecificationSerializer(serializers.ModelSerializer):
+    name = serializers.CharField(allow_blank=False)
+    value = serializers.CharField(allow_blank=False)
+    group = serializers.CharField(allow_blank=True, required=False)
+    unit = serializers.CharField(allow_blank=True, required=False)
+
     class Meta:
         model = ProductSpecification
         fields = [
-            "id", "product", "group", "name", "value", "unit",
-            "is_highlight", "sort_order", "created_at", "updated_at",
+            "id",
+            "product",
+            "group",
+            "name",
+            "value",
+            "unit",
+            "is_highlight",
+            "sort_order",
         ]
-        read_only_fields = ["created_at", "updated_at"]
+
+
+
+# class ProductSpecificationSerializer(serializers.ModelSerializer):
+#     class Meta:
+#         model = ProductSpecification
+#         fields = [
+#             "id", "product", "group", "name", "value", "unit",
+#             "is_highlight", "sort_order", "created_at", "updated_at",
+#         ]
+#         read_only_fields = ["created_at", "updated_at"]
 
 
 # ---------- Product (Read) ----------

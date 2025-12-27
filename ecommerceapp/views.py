@@ -983,7 +983,15 @@ class VendorViewSet(viewsets.ModelViewSet):
         return qs if u.is_staff else qs.filter(user=u)
 
     def perform_create(self, serializer):
-        serializer.save(user=self.request.user)
+        user = self.request.user
+
+        # ✅ PREVENT DUPLICATE VENDOR
+        if Vendor.objects.filter(user=user).exists():
+            raise ValidationError({
+                "vendor": "Vendor already exists for this user."
+            })
+
+        serializer.save(user=user)
 
 # ---------- Category ----------
 
@@ -1066,24 +1074,59 @@ class ProductViewSet(viewsets.ModelViewSet):
     def track_view(self, request, pk=None):
         Product.objects.filter(pk=pk).update(views_count=F("views_count") + 1)
         return Response({"ok": True})
-
+    
     @action(detail=True, methods=["put"], permission_classes=[IsAdminOrVendorOwner])
     def replace_specifications(self, request, pk=None):
         product = self.get_object()
-        ser = ProductSpecificationSerializer(data=request.data, many=True)
-        ser.is_valid(raise_exception=True)
-        ProductSpecification.objects.filter(product=product).delete()
-        for i, spec in enumerate(ser.validated_data):
-            ProductSpecification.objects.create(
+        data = request.data if isinstance(request.data, list) else []
+
+        # 1. Collect IDs sent from frontend that actually exist in DB
+        keep_ids = [item['id'] for item in data if 'id' in item and isinstance(item['id'], int)]
+
+        # 2. Delete anything NOT in that list
+        ProductSpecification.objects.filter(product=product).exclude(id__in=keep_ids).delete()
+
+        # 3. Update or Create
+        updated_specs = []
+        for i, item in enumerate(data):
+            spec_id = item.get('id')
+            
+            # Use update_or_create to avoid duplicates and keep existing IDs
+            obj, created = ProductSpecification.objects.update_or_create(
                 product=product,
-                name=spec["name"],
-                value=spec["value"],
-                unit=spec.get("unit") or "",
-                group=spec.get("group") or "",
-                is_highlight=spec.get("is_highlight") or False,
-                sort_order=spec.get("sort_order") or i,
+                id=spec_id if isinstance(spec_id, int) else None,
+                defaults={
+                    "name": item.get("name", "").strip(),
+                    "value": item.get("value", "").strip(),
+                    "group": item.get("group", "").strip(),
+                    "unit": item.get("unit", "").strip(),
+                    "is_highlight": bool(item.get("is_highlight", False)),
+                    "sort_order": item.get("sort_order", i),
+                }
             )
-        return Response({"ok": True})
+            updated_specs.append(obj)
+
+        # 4. Return the new list so Frontend can sync IDs
+        from .serializers import ProductSpecificationSerializer # ensure import
+        return Response(ProductSpecificationSerializer(updated_specs, many=True).data)
+
+    # @action(detail=True, methods=["put"], permission_classes=[IsAdminOrVendorOwner])
+    # def replace_specifications(self, request, pk=None):
+    #     product = self.get_object()
+    #     ser = ProductSpecificationSerializer(data=request.data, many=True)
+    #     ser.is_valid(raise_exception=True)
+    #     ProductSpecification.objects.filter(product=product).delete()
+    #     for i, spec in enumerate(ser.validated_data):
+    #         ProductSpecification.objects.create(
+    #             product=product,
+    #             name=spec["name"],
+    #             value=spec["value"],
+    #             unit=spec.get("unit") or "",
+    #             group=spec.get("group") or "",
+    #             is_highlight=spec.get("is_highlight") or False,
+    #             sort_order=spec.get("sort_order") or i,
+    #         )
+    #     return Response({"ok": True})
     
     @action(detail=False, methods=["get"], permission_classes=[permissions.IsAdminUser])
     def alerts(self, request):
