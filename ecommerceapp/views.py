@@ -994,7 +994,6 @@ class VendorViewSet(viewsets.ModelViewSet):
         serializer.save(user=user)
 
 # ---------- Category ----------
-
 class CategoryViewSet(viewsets.ModelViewSet):
     queryset = Category.objects.select_related("parent").prefetch_related("children").order_by("name")
     serializer_class = CategorySerializer
@@ -1007,7 +1006,6 @@ class CategoryViewSet(viewsets.ModelViewSet):
         return [permissions.AllowAny()] if self.action in ["list", "retrieve"] else [permissions.IsAuthenticated()]
 
 # ---------- Product & Variants & Specs ----------
-
 class ProductViewSet(viewsets.ModelViewSet):
     queryset = (
         Product.objects
@@ -1110,24 +1108,6 @@ class ProductViewSet(viewsets.ModelViewSet):
         from .serializers import ProductSpecificationSerializer # ensure import
         return Response(ProductSpecificationSerializer(updated_specs, many=True).data)
 
-    # @action(detail=True, methods=["put"], permission_classes=[IsAdminOrVendorOwner])
-    # def replace_specifications(self, request, pk=None):
-    #     product = self.get_object()
-    #     ser = ProductSpecificationSerializer(data=request.data, many=True)
-    #     ser.is_valid(raise_exception=True)
-    #     ProductSpecification.objects.filter(product=product).delete()
-    #     for i, spec in enumerate(ser.validated_data):
-    #         ProductSpecification.objects.create(
-    #             product=product,
-    #             name=spec["name"],
-    #             value=spec["value"],
-    #             unit=spec.get("unit") or "",
-    #             group=spec.get("group") or "",
-    #             is_highlight=spec.get("is_highlight") or False,
-    #             sort_order=spec.get("sort_order") or i,
-    #         )
-    #     return Response({"ok": True})
-    
     @action(detail=False, methods=["get"], permission_classes=[permissions.IsAdminUser])
     def alerts(self, request):
         """
@@ -1419,6 +1399,7 @@ class CartViewSet(viewsets.ModelViewSet):
                 ci = existing[key]
                 if mode == "replace":
                     ci.quantity = qty
+                    print("Quantity:-",ci.quantity)
                 else:
                     ci.quantity = max(1, ci.quantity + qty)
                 ci.save(update_fields=["quantity"])
@@ -1513,7 +1494,7 @@ class OrderViewSet(viewsets.ModelViewSet):
     serializer_class = OrderSerializer
 
     MIN_ORDER_SUBTOTAL = Decimal("100.00")
-    DELIVERY_FEE = Decimal("50.00")
+    DELIVERY_FEE = Decimal("70.00")
 
     def get_permissions(self):
         # allow guest checkout for COD and Razorpay confirm if you want
@@ -1664,7 +1645,7 @@ class OrderViewSet(viewsets.ModelViewSet):
     def _cart_compute_totals(self, cart, country_code="IN"):
         """
         subtotal: sum(unit price * qty)
-        shipping: ₹50 if ANY item pack > 1000g or 1000ml (above 1kg/1L)
+        shipping: ₹70 if ANY item pack > 1000g or 1000ml (above 1kg/1L)
         """
         subtotal = Decimal("0.00")
         need_delivery = False

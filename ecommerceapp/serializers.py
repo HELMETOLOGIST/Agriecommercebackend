@@ -180,7 +180,6 @@ class ColorSerializer(serializers.ModelSerializer):
 
 
 # ---------- Product images / variant images ----------
-
 class ProductImageSerializer(serializers.ModelSerializer):
     # accept raw integer id in multipart/form (write-only), and resolve to FK
     product = serializers.IntegerField(write_only=True)
@@ -224,7 +223,6 @@ class VariantImageSerializer(serializers.ModelSerializer):
 
 
 # ---------- Variants ----------
-
 class ProductVariantSerializer(serializers.ModelSerializer):
     color_id = IDRelatedField(source="color", queryset=Color.objects.all(), required=False, allow_null=True)
     price_override = serializers.CharField(required=False, allow_blank=True, allow_null=True)
@@ -252,7 +250,6 @@ class ProductVariantSerializer(serializers.ModelSerializer):
 
 
 # ---------- Specifications ----------
-
 class ProductSpecificationSerializer(serializers.ModelSerializer):
     name = serializers.CharField(allow_blank=False)
     value = serializers.CharField(allow_blank=False)
@@ -271,18 +268,6 @@ class ProductSpecificationSerializer(serializers.ModelSerializer):
             "is_highlight",
             "sort_order",
         ]
-
-
-
-# class ProductSpecificationSerializer(serializers.ModelSerializer):
-#     class Meta:
-#         model = ProductSpecification
-#         fields = [
-#             "id", "product", "group", "name", "value", "unit",
-#             "is_highlight", "sort_order", "created_at", "updated_at",
-#         ]
-#         read_only_fields = ["created_at", "updated_at"]
-
 
 # ---------- Product (Read) ----------
 
